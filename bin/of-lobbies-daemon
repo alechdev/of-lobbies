@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Background OpenFront.io lobby watcher for Waybar."""
+
+import asyncio
+import json
+import signal
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+WS_URI = "wss://openfront.io/w0/lobbies"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+RECONNECT_DELAY_S = 3
+MODES = ("off", "teams", "special", "individual")
+MODE_CATEGORY = {
+    "teams": "team",
+    "special": "special",
+    "individual": "ffa",
+}
+MODE_LABEL = {
+    "off": "off",
+    "teams": "teams",
+    "special": "special",
+    "individual": "individual",
+}
+MODE_SHORT = {
+    "teams": "T",
+    "special": "S",
+    "individual": "I",
+}
+
+STATE_DIR = Path.home() / ".local/state/of-lobbies"
+MODE_FILE = STATE_DIR / "mode"
+STATUS_FILE = STATE_DIR / "status.json"
+
+mode_changed = asyncio.Event()
+
+
+def read_mode() -> str:
+    try:
+        mode = MODE_FILE.read_text().strip()
+    except OSError:
+        mode = "off"
+    return mode if mode in MODES else "off"
+
+
+def as_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_countdown(delta_s: int, *, short: bool) -> str:
+    if delta_s < 60:
+        text = f"{delta_s}s"
+    else:
+        minutes, seconds = divmod(delta_s, 60)
+        if minutes < 60:
+            text = f"{minutes}:{seconds:02d}"
+        else:
+            hours, minutes = divmod(minutes, 60)
+            text = f"{hours}h{minutes:02d}m"
+    return text if short else f"in {text}"
+
+
+def format_starts_at(starts_at_ms: int | None, server_time_ms: int | None) -> str:
+    if not starts_at_ms:
+        return "start unknown"
+    if server_time_ms:
+        if starts_at_ms <= server_time_ms:
+            return "live"
+        delta_s = (starts_at_ms - server_time_ms) // 1000
+        return format_countdown(delta_s, short=False)
+    dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=timezone.utc).astimezone()
+    return dt.strftime("%H:%M")
+
+
+def format_starts_at_short(starts_at_ms: int | None, server_time_ms: int | None) -> str:
+    if not starts_at_ms:
+        return "—"
+    if server_time_ms:
+        if starts_at_ms <= server_time_ms:
+            return "live"
+        delta_s = (starts_at_ms - server_time_ms) // 1000
+        return format_countdown(delta_s, short=True)
+    dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=timezone.utc).astimezone()
+    return dt.strftime("%H:%M")
+
+
+def is_live(game: dict, server_time_ms: int | None) -> bool:
+    starts_at = as_int(game.get("startsAt"))
+    if not starts_at or not server_time_ms:
+        return False
+    return starts_at <= server_time_ms
+
+
+def format_team_count(cfg: dict, *, compact: bool = True) -> str:
+    raw_teams = cfg.get("playerTeams")
+    teams = as_int(raw_teams)
+    max_players = as_int(cfg.get("maxPlayers"))
+    if teams and max_players:
+        per_team = max_players // teams
+        return f"{teams}x{per_team}"
+    if teams:
+        return f"{teams}x?"
+    if isinstance(raw_teams, str) and raw_teams.strip():
+        label = raw_teams.strip()
+        if compact:
+            parts = label.split()
+            if len(parts) >= 3 and parts[1].lower() == "vs":
+                return f"{parts[0][0]}v{parts[2][0]}"
+            return label if len(label) <= 6 else label[:5] + "…"
+        return label
+    return "—"
+
+
+def is_team_config(cfg: dict) -> bool:
+    raw_teams = cfg.get("playerTeams")
+    return bool(as_int(raw_teams) or (isinstance(raw_teams, str) and raw_teams.strip())) or cfg.get("gameMode") == "Team"
+
+
+def describe_lobby(game: dict, server_time_ms: int | None) -> str:
+    cfg = game.get("gameConfig", {})
+    map_name = cfg.get("gameMap", "Unknown")
+    players = game.get("numClients", 0)
+    max_players = cfg.get("maxPlayers", "?")
+    mode = cfg.get("gameMode", "?")
+    if is_team_config(cfg):
+        size = format_team_count(cfg, compact=False)
+        detail = f"{map_name} {size}" if size != "—" else map_name
+    else:
+        detail = f"{map_name} ({mode})"
+    timing = format_starts_at(game.get("startsAt"), server_time_ms)
+    return f"{detail} | {players}/{max_players} | {timing}"
+
+
+def is_match(game: dict, mode: str) -> bool:
+    if mode != "teams":
+        return True
+    cfg = game.get("gameConfig", {})
+    player_teams = as_int(cfg.get("playerTeams"))
+    max_players = as_int(cfg.get("maxPlayers"))
+    return player_teams == 2 and max_players == 110
+
+
+def lobby_priority(game: dict, mode: str, server_time_ms: int | None) -> tuple:
+    live = is_live(game, server_time_ms)
+    players = game.get("numClients", 0)
+    starts_at = as_int(game.get("startsAt")) or (1 << 62)
+    match_rank = 0 if mode == "teams" and is_match(game, mode) else 1
+    return (live, match_rank, -players, starts_at)
+
+
+def pick_featured_lobby(
+    lobbies: list[dict],
+    mode: str,
+    server_time_ms: int | None,
+) -> dict | None:
+    if not lobbies:
+        return None
+    return min(lobbies, key=lambda game: lobby_priority(game, mode, server_time_ms))
+
+
+def short_map_name(game: dict | None, limit: int = 14) -> str:
+    if not game:
+        return "—"
+    name = game.get("gameConfig", {}).get("gameMap", "—")
+    if len(name) <= limit:
+        return name
+    return name[: limit - 1] + "…"
+
+
+def compact_bar_text(mode: str, game: dict | None, server_time_ms: int | None) -> str:
+    short = MODE_SHORT[mode]
+    if not game:
+        empty = "— — — —" if mode == "teams" else "— — —"
+        return f"󰞍 {short} {empty}"
+    cfg = game.get("gameConfig", {})
+    map_name = short_map_name(game)
+    players = game.get("numClients", 0)
+    max_players = cfg.get("maxPlayers", "?")
+    timing = format_starts_at_short(game.get("startsAt"), server_time_ms)
+    if mode == "teams":
+        teams_info = format_team_count(cfg, compact=True)
+        return f"󰞍 {short} {map_name} {teams_info} {players}/{max_players} {timing}"
+    return f"󰞍 {short} {map_name} {players}/{max_players} {timing}"
+
+
+def parse_all_lobbies(payload: dict) -> dict[str, list[dict]]:
+    games = payload.get("games", {})
+    return {
+        "teams": games.get("team", []),
+        "special": games.get("special", []),
+        "individual": games.get("ffa", []),
+    }
+
+
+def build_tooltip(mode: str, all_lobbies: dict[str, list[dict]], server_time_ms: int | None) -> str:
+    lines = [
+        f"OpenFront: {MODE_LABEL[mode]}",
+        "Click to cycle: off -> teams -> special -> individual",
+        "",
+    ]
+
+    sections = (
+        ("teams", "Teams", "watching 55v55 for alerts"),
+        ("special", "Special", None),
+        ("individual", "Individual", None),
+    )
+    for cat_mode, title, note in sections:
+        header = f"{title}:"
+        if note and mode == cat_mode:
+            header = f"{title} ({note}):"
+        lines.append(header)
+        lobbies = all_lobbies.get(cat_mode, [])
+        if lobbies:
+            sorted_lobbies = sorted(
+                lobbies,
+                key=lambda game: lobby_priority(game, cat_mode, server_time_ms),
+            )
+            for game in sorted_lobbies:
+                lines.append(f"  {describe_lobby(game, server_time_ms)}")
+        else:
+            lines.append("  (none)")
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def write_status_payload(payload: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(STATUS_FILE)
+
+
+def write_status(
+    *,
+    mode: str,
+    all_lobbies: dict[str, list[dict]] | None = None,
+    server_time_ms: int | None = None,
+) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    all_lobbies = all_lobbies or {
+        "teams": [],
+        "special": [],
+        "individual": [],
+    }
+
+    if mode == "off":
+        write_status_payload({
+            "text": "󰞍",
+            "class": "of-off",
+            "tooltip": "OpenFront: off\nClick to cycle: teams -> special -> individual",
+        })
+        return
+
+    active_lobbies = all_lobbies.get(mode, [])
+    featured = pick_featured_lobby(active_lobbies, mode, server_time_ms)
+    matches = [game for game in active_lobbies if is_match(game, mode)]
+
+    text = compact_bar_text(mode, featured, server_time_ms)
+    classes = [f"of-{mode}"]
+    if matches:
+        classes.append("of-match")
+
+    write_status_payload({
+        "text": text,
+        "class": " ".join(classes),
+        "tooltip": build_tooltip(mode, all_lobbies, server_time_ms),
+    })
+
+
+def request_mode_reload(*_args) -> None:
+    mode_changed.set()
+
+
+async def wait_for_mode_change(poll_s: float = 1.0) -> None:
+    mode_changed.clear()
+    try:
+        await asyncio.wait_for(mode_changed.wait(), timeout=poll_s)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def idle_off() -> None:
+    while read_mode() == "off":
+        write_status(mode="off")
+        await wait_for_mode_change(0.5)
+
+
+async def watch_active(mode: str) -> None:
+    try:
+        import websockets
+    except ImportError:
+        print("Missing dependency: websockets", file=sys.stderr)
+        await asyncio.sleep(30)
+        return
+
+    headers = {"Origin": "https://openfront.io", "User-Agent": USER_AGENT}
+
+    async with websockets.connect(WS_URI, additional_headers=headers) as ws:
+        async for raw in ws:
+            if read_mode() != mode:
+                return
+
+            payload = json.loads(raw)
+            server_time_ms = payload.get("serverTime")
+            all_lobbies = parse_all_lobbies(payload)
+
+            write_status(
+                mode=mode,
+                all_lobbies=all_lobbies,
+                server_time_ms=server_time_ms,
+            )
+
+
+async def run() -> None:
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGUSR1, signal.SIGUSR2):
+        loop.add_signal_handler(sig, request_mode_reload)
+
+    while True:
+        mode = read_mode()
+        if mode == "off":
+            await idle_off()
+            continue
+
+        try:
+            await watch_active(mode)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            write_status(mode=mode)
+            print(f"of-lobbies-daemon: {exc}", file=sys.stderr)
+            await wait_for_mode_change(RECONNECT_DELAY_S)
+
+
+def main() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not MODE_FILE.exists():
+        MODE_FILE.write_text("off\n")
+    if not STATUS_FILE.exists():
+        write_status(mode="off")
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+// Add "custom/of" to modules-right, then include this block:
+"custom/of": {
+	"return-type": "json",
+	"exec": "~/.config/waybar/scripts/of_status.sh",
+	"interval": 1,
+	"on-click": "~/.config/waybar/scripts/of_toggle.sh"
+}

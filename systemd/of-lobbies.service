@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenFront.io lobby watcher for Waybar
+After=network-online.target
+
+[Service]
+Environment=PYENV_ROOT=%h/.pyenv
+Environment=PATH=%h/.pyenv/shims:%h/.pyenv/bin:/usr/local/bin:/usr/bin
+ExecStart=%h/.pyenv/shims/python3 %h/dev/of-lobbies/bin/of-lobbies-daemon
+ExecReload=/bin/kill -USR1 $MAINPID
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
