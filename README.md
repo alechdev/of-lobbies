@@ -2,7 +2,11 @@
 
 Watch [OpenFront.io](https://openfront.io) public lobbies from Waybar or the terminal.
 
-![Waybar module showing live OpenFront lobbies](docs/waybar-screenshot.png)
+![OpenFront module with live lobby tooltip](docs/waybar-closeup.png)
+
+*Hover the module to see all three lobby categories. The bar shows the active category's featured lobby.*
+
+![Full Waybar with OpenFront module on the right](docs/waybar-bar.png)
 
 ## Components
 
