@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime, timezone
 
 WS_URI = "wss://openfront.io/w0/lobbies"
 USER_AGENT = (
@@ -14,17 +13,11 @@ USER_AGENT = (
 )
 RECONNECT_DELAY_S = 3
 
-
-def format_starts_at(starts_at_ms: int | None, server_time_ms: int | None) -> str:
-    if not starts_at_ms:
-        return "start time unknown"
-    if server_time_ms:
-        delta_s = max(0, (starts_at_ms - server_time_ms) // 1000)
-        if delta_s < 60:
-            return f"starts in {delta_s}s"
-        return f"starts in {delta_s // 60}m"
-    dt = datetime.fromtimestamp(starts_at_ms / 1000, tz=timezone.utc).astimezone()
-    return f"starts at {dt.strftime('%H:%M')}"
+CATEGORIES = (
+    ("teams", "team", "Teams"),
+    ("special", "special", "Special"),
+    ("individual", "ffa", "Individual"),
+)
 
 
 def as_int(value) -> int | None:
@@ -36,115 +29,83 @@ def as_int(value) -> int | None:
         return None
 
 
-def team_size_label(player_teams, max_players) -> str:
-    teams = as_int(player_teams)
-    max_p = as_int(max_players)
-    if not teams or not max_p:
-        return "team lobby"
-    per_team = max_p // teams
-    return f"{per_team}v{per_team} ({player_teams} teams, {max_players} max)"
-
-
-def is_team_lobby(game: dict) -> bool:
-    cfg = game.get("gameConfig", {})
-    return cfg.get("gameMode") == "Team" or bool(cfg.get("playerTeams"))
-
-
-def matches_filter(
-    game: dict,
-    *,
-    teams: int,
-    per_team: int,
-    map_name: str | None,
-) -> bool:
-    cfg = game.get("gameConfig", {})
-    player_teams = as_int(cfg.get("playerTeams"))
+def format_team_count(cfg: dict) -> str:
+    raw_teams = cfg.get("playerTeams")
+    teams = as_int(raw_teams)
     max_players = as_int(cfg.get("maxPlayers"))
-    if player_teams != teams or max_players != teams * per_team:
-        return False
-    if map_name and cfg.get("gameMap", "").lower() != map_name.lower():
-        return False
-    return True
+    if teams and max_players:
+        return f"{teams}x{max_players // teams}"
+    if isinstance(raw_teams, str) and raw_teams.strip():
+        return raw_teams.strip()
+    if teams:
+        return f"{teams} teams"
+    return ""
+
+
+def format_starts_at(starts_at_ms: int | None, server_time_ms: int | None) -> str:
+    if not starts_at_ms:
+        return "start unknown"
+    if server_time_ms:
+        if starts_at_ms <= server_time_ms:
+            return "live"
+        delta_s = (starts_at_ms - server_time_ms) // 1000
+        if delta_s < 60:
+            return f"in {delta_s}s"
+        minutes, seconds = divmod(delta_s, 60)
+        return f"in {minutes}:{seconds:02d}"
+    return "scheduled"
 
 
 def describe_lobby(game: dict, server_time_ms: int | None) -> str:
     cfg = game.get("gameConfig", {})
-    map_name = cfg.get("gameMap", "Unknown map")
-    size = team_size_label(cfg.get("playerTeams"), cfg.get("maxPlayers"))
+    map_name = cfg.get("gameMap", "Unknown")
+    team_info = format_team_count(cfg)
+    if team_info:
+        detail = f"{map_name} {team_info}"
+    else:
+        detail = f"{map_name} ({cfg.get('gameMode', '?')})"
     players = game.get("numClients", 0)
     max_players = cfg.get("maxPlayers", "?")
     timing = format_starts_at(game.get("startsAt"), server_time_ms)
     game_id = game.get("gameID", "?")
-    return (
-        f"{map_name} — {size}, {players}/{max_players} players, {timing} "
-        f"(id: {game_id})"
-    )
+    return f"{detail} | {players}/{max_players} | {timing} | {game_id}"
 
 
-def collect_team_lobbies(payload: dict) -> list[tuple[str, dict]]:
-    lobbies: list[tuple[str, dict]] = []
-    for category, games in payload.get("games", {}).items():
-        for game in games:
-            if is_team_lobby(game):
-                lobbies.append((category, game))
-    return lobbies
+def is_visible_lobby(game: dict) -> bool:
+    if game.get("numClients", 0) > 0:
+        return True
+    return as_int(game.get("startsAt")) is not None
 
 
-def target_label(per_team: int, map_name: str | None) -> str:
-    label = f"{per_team}v{per_team}"
-    if map_name:
-        return f"{map_name} {label}"
-    return label
+def parse_all_lobbies(payload: dict) -> dict[str, list[dict]]:
+    games = payload.get("games", {})
+    raw = {
+        "teams": games.get("team", []),
+        "special": games.get("special", []),
+        "individual": games.get("ffa", []),
+    }
+    return {key: [game for game in lobbies if is_visible_lobby(game)] for key, lobbies in raw.items()}
 
 
-def build_display(
-    *,
-    target: str,
-    matches: list[tuple[str, dict]],
-    team_lobbies: list[tuple[str, dict]],
-    server_time_ms: int | None,
-    show_all: bool,
-) -> str:
-    lines = [f"Watching for {target}... (Ctrl+C to quit)", ""]
-
-    if matches:
-        lines.append(f"Matching lobbies ({target}):")
-        for category, game in matches:
-            lines.append(f"  [{category}] {describe_lobby(game, server_time_ms)}")
-    else:
-        lines.append(f"No matching lobbies for {target}.")
-
-    if show_all or not matches:
-        lines.append("")
-        lines.append("All team lobbies:")
-        if team_lobbies:
-            for category, game in team_lobbies:
-                lines.append(f"  [{category}] {describe_lobby(game, server_time_ms)}")
+def build_display(all_lobbies: dict[str, list[dict]], server_time_ms: int | None, mode: str | None) -> str:
+    lines = ["OpenFront lobbies (Ctrl+C to quit)", ""]
+    for cat_mode, _, title in CATEGORIES:
+        if mode and cat_mode != mode:
+            continue
+        lines.append(f"{title}:")
+        lobbies = all_lobbies.get(cat_mode, [])
+        if lobbies:
+            for game in lobbies:
+                lines.append(f"  {describe_lobby(game, server_time_ms)}")
         else:
             lines.append("  (none)")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
-    return "\n".join(lines)
 
-
-def lobby_state_key(
-    team_lobbies: list[tuple[str, dict]],
-    matches: list[tuple[str, dict]],
-) -> str:
-    def entry(category: str, game: dict) -> tuple:
-        return (
-            category,
-            game.get("gameID"),
-            game.get("numClients"),
-            game.get("startsAt"),
-        )
-
-    return json.dumps(
-        {
-            "matches": [entry(c, g) for c, g in matches],
-            "lobbies": [entry(c, g) for c, g in team_lobbies],
-        },
-        sort_keys=True,
-    )
+def lobby_state_key(all_lobbies: dict[str, list[dict]], mode: str | None) -> str:
+    selected = {key: all_lobbies[key] for key in all_lobbies if not mode or key == mode}
+    return json.dumps(selected, sort_keys=True)
 
 
 async def watch(args: argparse.Namespace) -> None:
@@ -154,12 +115,7 @@ async def watch(args: argparse.Namespace) -> None:
         print("Missing dependency: websockets (pip install websockets)", file=sys.stderr)
         sys.exit(1)
 
-    headers = {
-        "Origin": "https://openfront.io",
-        "User-Agent": USER_AGENT,
-    }
-
-    target = target_label(args.per_team, args.map)
+    headers = {"Origin": "https://openfront.io", "User-Agent": USER_AGENT}
     last_state_key: str | None = None
     header_printed = False
 
@@ -169,34 +125,16 @@ async def watch(args: argparse.Namespace) -> None:
                 async for raw in ws:
                     payload = json.loads(raw)
                     server_time_ms = payload.get("serverTime")
-                    team_lobbies = collect_team_lobbies(payload)
-                    matches = [
-                        (category, game)
-                        for category, game in team_lobbies
-                        if matches_filter(
-                            game,
-                            teams=args.teams,
-                            per_team=args.per_team,
-                            map_name=args.map,
-                        )
-                    ]
-
-                    state_key = lobby_state_key(team_lobbies, matches)
-                    if state_key != last_state_key:
-                        if not args.quiet:
-                            if header_printed:
-                                sys.stdout.write("\033[2J\033[H")
-                            display = build_display(
-                                target=target,
-                                matches=matches,
-                                team_lobbies=team_lobbies,
-                                server_time_ms=server_time_ms,
-                                show_all=args.all,
-                            )
-                            print(display, flush=True)
-                            header_printed = True
-                        last_state_key = state_key
-
+                    all_lobbies = parse_all_lobbies(payload)
+                    state_key = lobby_state_key(all_lobbies, args.mode)
+                    if state_key == last_state_key:
+                        continue
+                    if not args.quiet:
+                        if header_printed:
+                            sys.stdout.write("\033[2J\033[H")
+                        print(build_display(all_lobbies, server_time_ms, args.mode), flush=True)
+                        header_printed = True
+                    last_state_key = state_key
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -207,28 +145,12 @@ async def watch(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Watch OpenFront.io team lobbies in the terminal.",
+        description="Watch OpenFront.io public lobbies in the terminal.",
     )
     parser.add_argument(
-        "--map",
-        help="Only match this map (e.g. Baikal). Omit to match any map.",
-    )
-    parser.add_argument(
-        "--teams",
-        type=int,
-        default=2,
-        help="Required number of teams (default: 2).",
-    )
-    parser.add_argument(
-        "--per-team",
-        type=int,
-        default=55,
-        help="Players per team (default: 55, so 55v55 with 2 teams).",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Always print all team lobbies, not only when there are no matches.",
+        "--mode",
+        choices=["teams", "special", "individual"],
+        help="Only show one lobby category.",
     )
     parser.add_argument(
         "--quiet",

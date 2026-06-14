@@ -2,10 +2,12 @@
 
 Watch [OpenFront.io](https://openfront.io) public lobbies from Waybar or the terminal.
 
+![Waybar module showing live OpenFront lobbies](docs/waybar-screenshot.png)
+
 ## Components
 
 - `bin/of-lobbies-daemon` — background watcher, writes Waybar status JSON
-- `bin/of-lobbies` — optional terminal watcher for 55v55 team lobbies
+- `bin/of-lobbies` — optional terminal lobby watcher
 - `waybar/` — Waybar scripts and config snippets
 - `systemd/of-lobbies.service` — user service for the daemon
 
@@ -36,7 +38,7 @@ Terminal watcher:
 
 ```bash
 of-lobbies
-of-lobbies --map Baikal --all
+of-lobbies --mode teams
 ```
 
 ## Runtime state

@@ -140,31 +140,27 @@ def describe_lobby(game: dict, server_time_ms: int | None) -> str:
     return f"{detail} | {players}/{max_players} | {timing}"
 
 
-def is_match(game: dict, mode: str) -> bool:
-    if mode != "teams":
+def is_visible_lobby(game: dict) -> bool:
+    """Skip empty queue slots the API keeps with no start time."""
+    if game.get("numClients", 0) > 0:
         return True
-    cfg = game.get("gameConfig", {})
-    player_teams = as_int(cfg.get("playerTeams"))
-    max_players = as_int(cfg.get("maxPlayers"))
-    return player_teams == 2 and max_players == 110
+    return as_int(game.get("startsAt")) is not None
 
 
-def lobby_priority(game: dict, mode: str, server_time_ms: int | None) -> tuple:
+def lobby_priority(game: dict, server_time_ms: int | None) -> tuple:
     live = is_live(game, server_time_ms)
     players = game.get("numClients", 0)
     starts_at = as_int(game.get("startsAt")) or (1 << 62)
-    match_rank = 0 if mode == "teams" and is_match(game, mode) else 1
-    return (live, match_rank, -players, starts_at)
+    return (live, -players, starts_at)
 
 
 def pick_featured_lobby(
     lobbies: list[dict],
-    mode: str,
     server_time_ms: int | None,
 ) -> dict | None:
     if not lobbies:
         return None
-    return min(lobbies, key=lambda game: lobby_priority(game, mode, server_time_ms))
+    return min(lobbies, key=lambda game: lobby_priority(game, server_time_ms))
 
 
 def short_map_name(game: dict | None, limit: int = 14) -> str:
@@ -194,11 +190,12 @@ def compact_bar_text(mode: str, game: dict | None, server_time_ms: int | None) -
 
 def parse_all_lobbies(payload: dict) -> dict[str, list[dict]]:
     games = payload.get("games", {})
-    return {
+    raw = {
         "teams": games.get("team", []),
         "special": games.get("special", []),
         "individual": games.get("ffa", []),
     }
+    return {key: [game for game in lobbies if is_visible_lobby(game)] for key, lobbies in raw.items()}
 
 
 def build_tooltip(mode: str, all_lobbies: dict[str, list[dict]], server_time_ms: int | None) -> str:
@@ -209,20 +206,17 @@ def build_tooltip(mode: str, all_lobbies: dict[str, list[dict]], server_time_ms:
     ]
 
     sections = (
-        ("teams", "Teams", "watching 55v55 for alerts"),
-        ("special", "Special", None),
-        ("individual", "Individual", None),
+        ("teams", "Teams"),
+        ("special", "Special"),
+        ("individual", "Individual"),
     )
-    for cat_mode, title, note in sections:
-        header = f"{title}:"
-        if note and mode == cat_mode:
-            header = f"{title} ({note}):"
-        lines.append(header)
+    for cat_mode, title in sections:
+        lines.append(f"{title}:")
         lobbies = all_lobbies.get(cat_mode, [])
         if lobbies:
             sorted_lobbies = sorted(
                 lobbies,
-                key=lambda game: lobby_priority(game, cat_mode, server_time_ms),
+                key=lambda game: lobby_priority(game, server_time_ms),
             )
             for game in sorted_lobbies:
                 lines.append(f"  {describe_lobby(game, server_time_ms)}")
@@ -262,17 +256,13 @@ def write_status(
         return
 
     active_lobbies = all_lobbies.get(mode, [])
-    featured = pick_featured_lobby(active_lobbies, mode, server_time_ms)
-    matches = [game for game in active_lobbies if is_match(game, mode)]
+    featured = pick_featured_lobby(active_lobbies, server_time_ms)
 
     text = compact_bar_text(mode, featured, server_time_ms)
-    classes = [f"of-{mode}"]
-    if matches:
-        classes.append("of-match")
 
     write_status_payload({
         "text": text,
-        "class": " ".join(classes),
+        "class": f"of-{mode}",
         "tooltip": build_tooltip(mode, all_lobbies, server_time_ms),
     })
 
