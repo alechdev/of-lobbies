@@ -234,6 +234,15 @@ def write_status_payload(payload: dict) -> None:
     tmp.replace(STATUS_FILE)
 
 
+def write_status_loading(mode: str) -> None:
+    short = MODE_SHORT[mode]
+    write_status_payload({
+        "text": f"󰞍 {short} loading",
+        "class": f"of-loading of-{mode}",
+        "tooltip": f"OpenFront: {MODE_LABEL[mode]} (loading…)",
+    })
+
+
 def write_status(
     *,
     mode: str,
@@ -285,6 +294,21 @@ async def idle_off() -> None:
         await wait_for_mode_change(0.5)
 
 
+async def cancel_pending(*tasks: asyncio.Task) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    for task in tasks:
+        if task.cancelled():
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+
 async def watch_active(mode: str) -> None:
     try:
         import websockets
@@ -296,7 +320,21 @@ async def watch_active(mode: str) -> None:
     headers = {"Origin": "https://openfront.io", "User-Agent": USER_AGENT}
 
     async with websockets.connect(WS_URI, additional_headers=headers) as ws:
-        async for raw in ws:
+        while read_mode() == mode:
+            recv_task = asyncio.create_task(ws.recv())
+            mode_task = asyncio.create_task(mode_changed.wait())
+            done, _pending = await asyncio.wait(
+                {recv_task, mode_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if mode_task in done:
+                mode_changed.clear()
+                await cancel_pending(recv_task)
+                return
+
+            await cancel_pending(mode_task)
+            raw = recv_task.result()
             if read_mode() != mode:
                 return
 
@@ -317,17 +355,20 @@ async def run() -> None:
         loop.add_signal_handler(sig, request_mode_reload)
 
     while True:
+        mode_changed.clear()
         mode = read_mode()
         if mode == "off":
             await idle_off()
             continue
 
+        write_status_loading(mode)
         try:
             await watch_active(mode)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            write_status(mode=mode)
+            if read_mode() == mode:
+                write_status_loading(mode)
             print(f"of-lobbies-daemon: {exc}", file=sys.stderr)
             await wait_for_mode_change(RECONNECT_DELAY_S)
 
